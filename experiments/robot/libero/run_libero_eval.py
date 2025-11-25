@@ -29,6 +29,17 @@ import tqdm
 from libero.libero import benchmark
 
 import wandb
+import torch
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+try:
+    from actionflow import enable_actionflow
+    print("✅ [ActionFlow] Package imported successfully.")
+except ImportError as e:
+    print(f"❌ [ActionFlow] Import failed: {e}")
+    sys.exit(1)
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
@@ -84,9 +95,12 @@ class GenerateConfig:
 
     seed: int = 7                                    # Random Seed (for reproducibility)
 
+    use_pipe: bool = True
+
     # fmt: on
 
 
+@torch.no_grad()
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
     assert cfg.pretrained_checkpoint is not None, "cfg.pretrained_checkpoint must not be None!"
@@ -102,6 +116,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Load model
     model = get_model(cfg)
+    if cfg.use_pipe:
+        print(f"\n🚀 [ActionFlow] Enabling Acceleration Pipeline (Chunk Size = 7)...")
+        model = enable_actionflow(model, max_new_tokens=7)
 
     # [OpenVLA] Check that the model contains the action un-normalization key
     if cfg.model_family == "openvla":
@@ -118,6 +135,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     # Initialize local logging
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-{DATE_TIME}"
+    if cfg.use_pipe:
+        run_id += "-ActionFlow"
     if cfg.run_id_note is not None:
         run_id += f"--{cfg.run_id_note}"
     os.makedirs(cfg.local_log_dir, exist_ok=True)
@@ -183,6 +202,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
+
+            wait_pipe = 0
             while t < max_steps + cfg.num_steps_wait:
                 try:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -195,8 +216,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     # Get preprocessed image
                     img = get_libero_image(obs, resize_size)
 
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
 
                     # Prepare observations dict
                     # Note: OpenVLA does not take proprio state as input
@@ -207,7 +226,6 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         ),
                     }
 
-                    # Query model to get action
                     action = get_action(
                         cfg,
                         model,
@@ -215,6 +233,16 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         task_description,
                         processor=processor,
                     )
+
+                    if cfg.use_pipe and wait_pipe <  len(action):
+                        wait_pipe += 1
+                        continue
+                    else:
+                        print(f"step: {t}, action: {action}")
+                        wait_pipe = 0
+
+                    # Save preprocessed image for replay video
+                    replay_images.append(img)
 
                     # Normalize gripper action [0,1] -> [-1,+1] because the environment expects the latter
                     action = normalize_gripper_action(action, binarize=True)
