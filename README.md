@@ -1,6 +1,8 @@
 
 # ActionFlow: Pipelined Action Acceleration for Vision Language Models on Edge
 
+[![Paper](https://img.shields.io/badge/Paper-Arxiv-b31b1b?logo=arxiv&logoColor=white)](https://arxiv.org/html/2512.20276v1)
+
 **ActionFlow** is a system-level inference acceleration framework designed for Vision-Language-Action (VLA) models (e.g., OpenVLA). Tailored for resource-constrained edge platforms, it utilizes a novel **Cross-Request Pipelining** strategy and custom **Triton Kernels** to achieve significant inference speedups without retraining or compromising model accuracy.
 
 > **Paper Title:** ActionFlow: A Pipelined Action Acceleration for Vision Language Models on Edge
@@ -111,3 +113,19 @@ python vla-scripts/extern/benchmark.py --use_pipe 1
 | :--- | :--- | :--- |
 | Baseline | 1.25 | 803.0 |
 | **ActionFlow** | **3.20 (2.56x)** | **313.1** |
+
+## 🔗 Citation
+If you find ActionFlow useful for your research and applications, please cite our paper:
+
+
+```bibtex
+@misc{actionflow2025,
+      title={ActionFlow: A Pipelined Action Acceleration for Vision Language Models on Edge}, 
+      author={Yuntao Dai and Hang Gu and Teng Wang and Qianyu Cheng and Yifei Zheng and Zhiyong Qiu and Lei Gong and Wenqi Lou and Xuehai Zhou},
+      year={2025},
+      eprint={2512.20276},
+      archivePrefix={arXiv},
+      primaryClass={cs.AI},
+      url={https://arxiv.org/abs/2512.20276}
+}
+```
