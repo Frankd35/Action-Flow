@@ -37,15 +37,35 @@ ActionFlow/
 ## 🛠️ Installation
 ### Prerequisites & Environment
 
-We strongly recommend using **Docker** (or `jetson-containers` on Edge) to ensure a consistent environment.
+**1. Jetson AGX Orin (Recommended for Edge)**
 
-**Jetson AGX Orin (Recommended for Edge)**
 We utilized the `dustynv/openvla` container from [jetson-containers](https://github.com/dusty-nv/jetson-containers). You can launch the environment directly:
 
 ```bash
 jetson-containers run --name openvla -it $(autotag openvla) bash
 ```
-### Setup
+
+**2. GPU Server / Desktop (General CUDA)**
+
+For workstations or servers equipped with NVIDIA GPUs (e.g., RTX 3090/4090, A100, H100), please follow these steps:
+
+**Step A: Base Environment**
+First, follow the official [OpenVLA GitHub](https://github.com/openvla/openvla) instructions to install the base dependencies.
+
+**Step B: Install Optimized Requirements**
+Install the following specific versions of key libraries:
+
+```bash
+pip install transformers==4.49.0 
+pip install triton==3.2.0
+pip install flash_attn==2.8.3
+pip install "accelerate>=0.26.0"
+
+```
+
+---
+
+### Setup 
 
 Once inside the container or environment, install the ActionFlow engine:
 
