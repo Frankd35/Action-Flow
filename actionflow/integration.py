@@ -1,8 +1,8 @@
 import torch
 import types
-from .modeling.pipeline import ActionFlowPipeline
+from .modeling.pipeline import ActionFlowPipeline, ActionFlowBaselinePipeline, ActionFlowVarlenBaselinePipeline
 
-def enable_actionflow(vla_model, max_new_tokens=7):
+def enable_actionflow(vla_model, max_new_tokens=7, pipeline_type="optimized"):
     """
     Enables ActionFlow acceleration on an existing OpenVLA model instance.
     This performs in-place monkey-patching of the model's prediction methods.
@@ -10,15 +10,33 @@ def enable_actionflow(vla_model, max_new_tokens=7):
     Args:
         vla_model: The Prismatic/OpenVLA model instance.
         max_new_tokens: The depth of the pipeline (K).
+        pipeline_type (str):
+            - "optimized": Triton in-place shift + flatten kv buffer
+            - "varlen": FlashAttn Varlen + PipeStaticCache + torch.cat
+            - "eager": Eager Attention with loop
     """
     print(f"[ActionFlow] Initializing pipeline with depth K={max_new_tokens}...")
     
-    # 1. Initialize the Pipeline Engine
-    # This wraps the underlying LLM but shares weights
-    pipeline_engine = ActionFlowPipeline(
-        vla_model.language_model, 
-        max_token=max_new_tokens
-    )
+    if pipeline_type == "eager":
+        print("[ActionFlow] USING BASELINE: Eager Attention (Slowest)")
+        pipeline_engine = ActionFlowBaselinePipeline(
+            vla_model.language_model, 
+            max_token=max_new_tokens
+        )
+    elif pipeline_type == "varlen":
+        print("[ActionFlow] USING BASELINE: Varlen Attention + Concat (Medium)")
+        pipeline_engine = ActionFlowVarlenBaselinePipeline(
+            vla_model.language_model, 
+            max_token=max_new_tokens
+        )
+    elif pipeline_type == "optimized":
+        print("[ActionFlow] USING OPTIMIZED: Triton In-place + FA2 (Fastest)")
+        pipeline_engine = ActionFlowPipeline(
+            vla_model.language_model, 
+            max_token=max_new_tokens
+        )
+    else:
+        raise ValueError(f"Unknown pipeline_type: {pipeline_type}")    
     
     # Attach engine to model to prevent garbage collection
     vla_model.actionflow_engine = pipeline_engine
@@ -46,7 +64,8 @@ def enable_actionflow(vla_model, max_new_tokens=7):
         # Note: This executes one step of the macro-pipeline.
         # It takes the current frame's embeddings and returns the finished action
         # from (K-1) frames ago.
-        output_ids = self.actionflow_engine.pipe_forward(multimodal_embeddings)
+        with torch.cuda.nvtx.range('self.actionflow_engine.pipe_forward'):
+            output_ids = self.actionflow_engine.pipe_forward(multimodal_embeddings)
         
         # D. Decode Action (Standard VLA backend)
         # Convert IDs back to continuous actions

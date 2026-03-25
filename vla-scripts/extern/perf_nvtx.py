@@ -13,12 +13,12 @@ if PROJECT_ROOT not in sys.path:
 
 try:
     from actionflow import enable_actionflow
-
     print("✅ [ActionFlow] Package imported successfully.")
 except ImportError as e:
     print(f"❌ [ActionFlow] Import failed: {e}")
     sys.exit(1)
 
+import torch.cuda.nvtx as nvtx
 
 # === Verification Arguments
 MODEL_PATH = "openvla/openvla-7b"
@@ -46,31 +46,16 @@ def verify_openvla() -> None:
     print("[*] Instantiating Processor and Pretrained OpenVLA")
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
-    # # === BFLOAT16 + FLASH-ATTN MODE ===
-    # print("[*] Loading in BF16 with Flash-Attention Enabled")
-    # vla = AutoModelForVision2Seq.from_pretrained(
-    #     MODEL_PATH,
-    #     attn_implementation="flash_attention_2",
-    #     torch_dtype=torch.bfloat16,
-    #     low_cpu_mem_usage=True,
-    #     trust_remote_code=True,
-    # ).to(device)
-
-    # === 4-BIT QUANTIZATION MODE (`pip install bitsandbytes`) + FLASH-ATTN :: [~6GB VRAM] ===
-    print("[*] Loading in 4-Bit Quantization Mode with Flash-Attention")
+    # === BFLOAT16 + FLASH-ATTN MODE ===
+    print("[*] Loading in BF16 with Flash-Attention Enabled")
     vla = AutoModelForVision2Seq.from_pretrained(
         MODEL_PATH,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-        ),
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-    )
-
+    ).to(device)
+    
     print("[*] Injecting ActionFlow Acceleration...")
     vla = enable_actionflow(vla, max_new_tokens=7)
 
@@ -81,7 +66,8 @@ def verify_openvla() -> None:
     warmup_image = Image.fromarray(np.asarray(np.random.rand(256, 256, 3) * 255, dtype=np.uint8))
     warmup_inputs = processor(prompt, warmup_image).to(device, dtype=torch.bfloat16)
     # _ = vla.predict_action(**warmup_inputs, unnorm_key="bridge_orig", do_sample=False)
-    _ = vla.predict_action(**warmup_inputs, unnorm_key="bridge_orig", do_sample=False)
+    with nvtx.range("warm up"):
+        _ = vla.predict_action(**warmup_inputs, unnorm_key="bridge_orig", do_sample=False)
 
     # Actual timing runs
     num_runs = 20
@@ -93,11 +79,11 @@ def verify_openvla() -> None:
         inputs = processor(prompt, image).to(device, dtype=torch.bfloat16)
 
         start_time = time.perf_counter()
-        # action = vla.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
-        action = vla.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
+        with nvtx.range("vla.predict_action"):
+            action = vla.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
         elapsed = time.perf_counter() - start_time
         times.append(elapsed)
-        print(f"\t=>> Iter {i + 1:2d}: Time = {elapsed:.4f}s || Action = {action}")
+        print(f"\t=>> Iter {i+1:2d}: Time = {elapsed:.4f}s || Action = {action}")
 
     # Compute stats
     times = np.array(times)
@@ -107,15 +93,14 @@ def verify_openvla() -> None:
     mean_fps = fps.mean()
     std_fps = fps.std()
 
-    print("\n" + "=" * 60)
+    print("\n" + "="*60)
     print(f"📊 Inference Timing Results ({num_runs} runs):")
     print(f"   Avg Time: {mean_time:.4f} ± {std_time:.4f} seconds")
     print(f"   Avg FPS : {mean_fps:.2f} ± {std_fps:.2f}")
-    print("=" * 60)
+    print("="*60)
 
 
 import random
-
 if __name__ == "__main__":
     SEED = 42
     np.random.seed(SEED)

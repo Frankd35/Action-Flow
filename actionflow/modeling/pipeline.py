@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 from .layers import LlamaPIPEDecodeLayer
+from .layers import ActionFlowVarlenBaselineDecodeLayer
+from .layers import ActionFlowBaselineDecodeLayer, PipeStaticCache
 
 class ActionFlowPipeline(nn.Module):
     """
@@ -157,16 +159,17 @@ class ActionFlowPipeline(nn.Module):
             # Careful slicing to match the shape expected by the kernel
             active_buffer = raw_buffer[: 2 * total_L_kv * H_kv * D_h].view(2, total_L_kv, H_kv, D_h)
             
-            current_hidden_states = layer.packed_forward(
-                batch_hidden_states=current_hidden_states,
-                kv_ring_buffer=active_buffer,
-                global_position_embeddings=rope_slice,
-                seq_lens=seq_lens,
-                cu_seqlens_q=_cu_seqlens_q,
-                cu_seqlens_k=_cu_seqlens_k,
-                max_seqlen_q=_max_seqlen_q,
-                max_seqlen_k=_max_seqlen_k
-            )
+            with torch.cuda.nvtx.range('Fusion.packed_forward'):
+                current_hidden_states = layer.packed_forward(
+                    batch_hidden_states=current_hidden_states,
+                    kv_ring_buffer=active_buffer,
+                    global_position_embeddings=rope_slice,
+                    seq_lens=seq_lens,
+                    cu_seqlens_q=_cu_seqlens_q,
+                    cu_seqlens_k=_cu_seqlens_k,
+                    max_seqlen_q=_max_seqlen_q,
+                    max_seqlen_k=_max_seqlen_k
+                )
 
         # === Step 4: Pipeline State Update ===
         # Shift hidden states: Stage i -> Stage i+1
@@ -195,3 +198,134 @@ class ActionFlowPipeline(nn.Module):
         self._stage_ids = [None, *self._stage_ids[:-1]]
         
         return final_output_ids.unsqueeze(0) # (1, seq_len)
+
+
+class ActionFlowBaselinePipeline(ActionFlowPipeline):
+    """
+    Baseline Pipeline：管理旧版的 Cache Ring Buffer，调度旧版的 Layer。
+    """
+    def __init__(self, llama_model: nn.Module, max_token: int = 8):
+        super().__init__(llama_model, max_token)
+        # 将 self.layers 替换为 Baseline Layer
+        self.layers = nn.ModuleList([
+            ActionFlowBaselineDecodeLayer(layer, self.config) 
+            for layer in self.base_model.model.layers
+        ])
+        self._stage_past_key_values = None
+        self.nvtx_str = "Baseline.packed_forward"
+
+    def init_resources(self, prefill_len: int, max_new_tokens: int):
+        if self._initialized and self.max_token == max_new_tokens:
+            self.prefill_len = prefill_len
+            return
+
+        self.max_token = max_new_tokens
+        self.decode_steps = max_new_tokens - 1
+        self.prefill_len = prefill_len
+        self.total_seq_len = prefill_len + self.decode_steps
+        
+        # 初始化基于类的 Cache Ring Buffer (替代了你优化版的 Raw Tensor Buffer)
+        self._stage_past_key_values = [
+            PipeStaticCache(
+                config=self.config,
+                max_batch_size=1,
+                max_cache_len=self.total_seq_len + 32,
+                device=self.device,
+                dtype=self.dtype
+            ) for _ in range(self.max_token)
+        ]
+        
+        self._stage_hidden_states = [None for _ in range(self.max_token)]
+        self._stage_ids = [torch.zeros(i, device=self.device, dtype=torch.long) for i in range(self.max_token)]
+        
+        dummy_input = torch.zeros(1, 4096, self.hidden_size, device=self.device, dtype=self.dtype)
+        dummy_ids = torch.arange(4096, device=self.device).unsqueeze(0)
+        self._global_position_embeddings = self.rotary_emb(dummy_input, dummy_ids)
+        
+        self._initialized = True
+
+    def pipe_forward(self, new_prefill_inputs_embeds: torch.Tensor):
+        self.prefill_len = new_prefill_inputs_embeds.shape[1]
+        self.total_seq_len = self.prefill_len + self.decode_steps
+        
+        batch_hidden_states = [new_prefill_inputs_embeds]
+        batch_position_ids = [torch.arange(self.prefill_len, device=self.device).unsqueeze(0)]
+        
+        # 组装 Inputs
+        for stage in range(1, self.max_token):
+            prev_hs = self._stage_hidden_states[stage]
+            if prev_hs is not None:
+                next_emb = self._compute_next_token_and_embedding(prev_hs)
+                batch_hidden_states.append(next_emb)
+            else:
+                rand_emb = torch.randn(1, 1, self.hidden_size, device=self.device, dtype=self.dtype)
+                batch_hidden_states.append(rand_emb)
+            
+            pos_id = torch.tensor([[self.prefill_len + stage - 1]], device=self.device)
+            batch_position_ids.append(pos_id)
+        
+        seq_lens = [self.prefill_len] + [1] * self.decode_steps
+        current_hidden_states = batch_hidden_states
+        
+        rope_slice = (
+            self._global_position_embeddings[0][:, :self.total_seq_len, :],
+            self._global_position_embeddings[1][:, :self.total_seq_len, :]
+        )
+
+        # Baseline Forward
+        for layer in self.layers:
+            with torch.cuda.nvtx.range(self.nvtx_str):
+                current_hidden_states = layer.packed_forward(
+                    batch_hidden_states=current_hidden_states,
+                    batch_past_key_values=self._stage_past_key_values,  # 传入对象数组
+                    batch_position_ids=batch_position_ids,
+                    global_position_embeddings=rope_slice,
+                    seq_lens=seq_lens
+                )
+
+        # 状态平移
+        self._stage_hidden_states = [None, *current_hidden_states[:-1]]
+        
+        # 缓存平移 (替代了你优化版底层的 Triton In-place Shift)
+        self._stage_past_key_values = [
+            PipeStaticCache(
+                config=self.config, max_batch_size=1, max_cache_len=self.total_seq_len + 32,
+                device=self.device, dtype=self.dtype
+            ), 
+            *self._stage_past_key_values[:-1]
+        ]
+        
+        # 解码 Token IDs
+        for stage in range(self.max_token):
+            hs = current_hidden_states[stage]
+            hs = self.norm(hs)
+            logits = self.lm_head(hs)
+            token_id = torch.argmax(logits[:, -1, :], dim=-1).squeeze(0)
+            
+            if stage == 0:
+                self._stage_ids[stage] = token_id.unsqueeze(0)
+            else:
+                self._stage_ids[stage] = torch.cat([self._stage_ids[stage], token_id.unsqueeze(0)])
+        
+        final_output_ids = self._stage_ids[self.max_token - 1]
+        self._stage_ids = [None, *self._stage_ids[:-1]]
+        
+        return final_output_ids.unsqueeze(0)
+    
+
+class ActionFlowVarlenBaselinePipeline(ActionFlowBaselinePipeline):
+    """
+    Varlen Baseline Pipeline: 
+    缓存管理逻辑与普通 Baseline 一致 (使用 PipeStaticCache)。
+    仅仅是在 Layer 层替换为了使用 Flash Attention Varlen 的版本。
+    """
+    def __init__(self, llama_model: nn.Module, max_token: int = 8):
+        super().__init__(llama_model, max_token)
+        
+        # 核心替换：将 layers 替换为 Varlen 版本
+        self.layers = nn.ModuleList([
+            ActionFlowVarlenBaselineDecodeLayer(layer, self.config) 
+            for layer in self.base_model.model.layers
+        ])
+        
+        self.nvtx_str = "fa_var_len.packed_forward"
