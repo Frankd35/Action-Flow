@@ -7,6 +7,8 @@
 
 > **Paper Title:** ActionFlow: A Pipelined Action Acceleration for Vision Language Models on Edge
 
+> 🎉 Accepted at **DAC 2026**!
+
 ## 🚀 Key Features
 
   * **⚡ High Performance:** Achieves **2.55x** FPS improvement on NVIDIA Jetson AGX Orin and RTX 5090.
@@ -127,12 +129,25 @@ python vla-scripts/extern/benchmark.py --use_pipe 0
 python vla-scripts/extern/benchmark.py --use_pipe 1
 ```
 
-**Performance Preview (AGX Orin):**
+**Performance Preview (NVIDIA Jetson AGX Orin):**
 
-| Method | FPS (Speedup) | Latency (ms) |
-| :--- | :--- | :--- |
-| Baseline | 1.25 | 803.0 |
-| **ActionFlow** | **3.20 (2.56x)** | **313.1** |
+| Mode | Quantization | FPS | Speedup | Latency (ms) |
+| :--- | :--- | :--- | :--- | :--- |
+| Baseline (Autoregressive) | BF16 | 1.25 | 1.00x | 803.0 |
+| ActionFlow | BF16 | **3.20** | **2.56x** | **313.1** |
+| Baseline (Autoregressive) | INT4 | - | - | - |
+| ActionFlow | INT4 | - | - | - |
+
+**Performance Preview (NVIDIA THOR):**
+
+| Mode | Quantization | FPS | Speedup | Latency (ms) |
+| :--- | :--- | :--- | :--- | :--- |
+| Baseline (Autoregressive) | BF16 | 1.51 | 1.00x | 664.4 |
+| ActionFlow | BF16 | **6.84** | **4.53x** | **146.1** |
+| Baseline (Autoregressive) | INT4 | 2.09 | 1.38x | 477.5 |
+| ActionFlow | INT4 | **8.78** | **5.81x** | **113.9** |
+
+> **Note:** Speedup for ActionFlow is relative to the BF16 Baseline. Run `python vla-scripts/extern/benchmark.py --use_pipe 0 --quantize bf16` for BF16 Baseline, `--use_pipe 1 --quantize bf16` for BF16 ActionFlow, `--use_pipe 0 --quantize int4` for INT4 Baseline, and `--use_pipe 1 --quantize int4` for INT4 ActionFlow.
 
 ## 🔗 Citation
 If you find ActionFlow useful for your research and applications, please cite our paper:

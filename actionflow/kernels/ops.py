@@ -101,7 +101,7 @@ class TritonLlamaRMSNorm(nn.Module):
             BLOCK_SIZE_N=BLOCK_SIZE_N,
         )
 
-        return output.view(input_shape)
+        return output.view(input_shape).contiguous()
 
     def extra_repr(self) -> str:
         return f"weight_shape={tuple(self.weight.shape)}, eps={self.variance_epsilon} (Triton)"

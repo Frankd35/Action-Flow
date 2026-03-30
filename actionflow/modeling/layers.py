@@ -6,6 +6,14 @@ from transformers.models.llama.modeling_llama import eager_attention_forward, ap
 from transformers.cache_utils import Cache
 from typing import Optional, Dict, Any, Tuple, List
 
+# Bitsandbytes integration for optimized INT4 inference
+try:
+    import bitsandbytes.functional as bnb_F
+    from bitsandbytes.nn import Linear4bit
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+
 from actionflow.kernels.ops import (
     TritonLlamaRMSNorm,
     fused_rope_write_kv_wrapper,
@@ -43,6 +51,18 @@ class LlamaPIPEDecodeLayer(nn.Module):
         )
         self.post_attention_layernorm.weight = original_layer.post_attention_layernorm.weight
 
+    def _optimized_linear(self, layer, x):
+        """Forces BNB's gemv_4bit kernel for M > 1 to bypass the slow dequantization path."""
+        if HAS_BNB and isinstance(layer, Linear4bit) and not x.requires_grad:
+            shape = x.shape
+            x_2d = x.view(-1, shape[-1])
+            # Directly call the functional gemv_4bit to bypass M=1 threshold in BNB autograd
+            out = bnb_F.gemv_4bit(x_2d, layer.weight.t(), state=layer.weight.quant_state)
+            if layer.bias is not None:
+                out += layer.bias
+            return out.view(*shape[:-1], -1)
+        return layer(x)
+
     def packed_forward(
         self,
         batch_hidden_states,   # List[Tensor]
@@ -70,10 +90,10 @@ class LlamaPIPEDecodeLayer(nn.Module):
         # Apply Triton RMSNorm
         normed = self.input_layernorm(residual)
         
-        # Use original projections
-        queries = self.original_layer.self_attn.q_proj(normed)
-        keys = self.original_layer.self_attn.k_proj(normed)
-        values = self.original_layer.self_attn.v_proj(normed)
+        # Use original projections (optimized for BNB INT4)
+        queries = self._optimized_linear(self.original_layer.self_attn.q_proj, normed)
+        keys = self._optimized_linear(self.original_layer.self_attn.k_proj, normed)
+        values = self._optimized_linear(self.original_layer.self_attn.v_proj, normed)
 
         # Reshape to (B, L, H, D_h)
         queries = queries.view(B, L, -1, self.head_dim)
@@ -126,7 +146,7 @@ class LlamaPIPEDecodeLayer(nn.Module):
         
         # === Step 6: Output Projection & MLP ===
         attn_concat = attn_output.view(B, L, D)
-        attn_concat = self.original_layer.self_attn.o_proj(attn_concat)
+        attn_concat = self._optimized_linear(self.original_layer.self_attn.o_proj, attn_concat)
         
         # First Residual
         hidden_states = residual + attn_concat
@@ -134,7 +154,13 @@ class LlamaPIPEDecodeLayer(nn.Module):
         # MLP Block (Norm -> MLP -> Residual)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.original_layer.mlp(hidden_states)
+        
+        # Manually execute optimized MLP projections
+        mlp = self.original_layer.mlp
+        gate_out = self._optimized_linear(mlp.gate_proj, hidden_states)
+        up_out = self._optimized_linear(mlp.up_proj, hidden_states)
+        hidden_states = self._optimized_linear(mlp.down_proj, mlp.act_fn(gate_out) * up_out)
+        
         hidden_states = residual + hidden_states
 
         # === Step 7: Split Outputs ===

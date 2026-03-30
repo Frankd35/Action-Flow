@@ -11,7 +11,7 @@ import time
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
 from typing import Dict, Tuple, Optional
 
 import sys
@@ -25,6 +25,7 @@ if PROJECT_ROOT not in sys.path:
 
 try:
     from actionflow import enable_actionflow
+
     print("✅ [ActionFlow] Package imported successfully.")
 except ImportError as e:
     print(f"❌ [ActionFlow] Import failed: {e}")
@@ -32,16 +33,16 @@ except ImportError as e:
 
 
 # === Configuration ===
-MODEL_PATH: str = "openvla/openvla-7b"
+MODEL_PATH: str = "/home/daiyuntao/jetson-containers/data/models/huggingface/models--openvla--openvla-7b/snapshots/31f090d05236101ebfc381b61c674dd4746d4ce0"
 SYSTEM_PROMPT: str = (
     "A chat between a curious user and an artificial intelligence assistant. "
     "The assistant gives helpful, detailed, and polite answers to the user's questions."
 )
 INSTRUCTION: str = "put spoon on towel"
 
-PREFILL_LENGTHS: list = [16, 32, 64, 128, 256]   # Target text token count (image tokens ~256 fixed)
-DECODE_LENGTHS: list = [7, 16, 24, 32]           # Number of generated action tokens
-NUM_RUNS: int = 20                                # Number of timed runs per configuration (after warmup)
+PREFILL_LENGTHS: list = [16, 32, 64, 128, 256]  # Target text token count (image tokens ~256 fixed)
+DECODE_LENGTHS: list = [7, 16, 24, 32]  # Number of generated action tokens
+NUM_RUNS: int = 20  # Number of timed runs per configuration (after warmup)
 
 
 def get_openvla_prompt(instruction: str) -> str:
@@ -56,18 +57,12 @@ def get_openvla_prompt(instruction: str) -> str:
         Formatted input prompt string
     """
     if "v01" in MODEL_PATH:
-        return (
-            f"{SYSTEM_PROMPT} USER: What action should the robot take to {instruction.lower()}? ASSISTANT:"
-        )
+        return f"{SYSTEM_PROMPT} USER: What action should the robot take to {instruction.lower()}? ASSISTANT:"
     else:
         return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
 
 
-def construct_prompt_by_token_length(
-    prompt_template: str,
-    target_len: int,
-    tokenizer
-) -> str:
+def construct_prompt_by_token_length(prompt_template: str, target_len: int, tokenizer) -> str:
     """
     Constructs a prompt with approximately `target_len` tokens by padding with safe phrases.
 
@@ -101,26 +96,60 @@ def construct_prompt_by_token_length(
 
 
 @torch.inference_mode()
-def benchmark_prefill_decode(use_pipe: bool = False):
+def benchmark_prefill_decode(use_pipe: bool = False, quantize: str = "bf16"):
     """
     Benchmark OpenVLA inference across various prefill and decode lengths.
 
     Args:
         use_pipe: If True, uses ActionFlow-accelerated pipeline instead of HF `.generate()`
+        quantize: Quantization mode - "bf16", "int4", or "int8"
     """
     print(f"[*] Loading OpenVLA model: `{MODEL_PATH}`")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] Using device: {device}")
 
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
-    print("[*] Loading model in bfloat16 with FlashAttention-2...")
-    vla = AutoModelForVision2Seq.from_pretrained(
-        MODEL_PATH,
-        attn_implementation="flash_attention_2",
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device)
+
+    # === BF16 MODE (Default) ===
+    if quantize == "bf16":
+        print("[*] Loading model in BF16 with FlashAttention-2...")
+        vla = AutoModelForVision2Seq.from_pretrained(
+            MODEL_PATH,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).to(device)
+
+    # === INT4 QUANTIZATION MODE + FLASH-ATTN :: [~6GB VRAM] ===
+    elif quantize == "int4":
+        print("[*] Loading model in INT4 Quantization with FlashAttention-2...")
+        vla = AutoModelForVision2Seq.from_pretrained(
+            MODEL_PATH,
+            attn_implementation="flash_attention_2",
+            torch_dtype=torch.bfloat16,
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+            ),
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+
+    # === INT8 QUANTIZATION MODE (no FlashAttention) :: [~9GB VRAM] ===
+    elif quantize == "int8":
+        print("[*] Loading model in INT8 Quantization (FlashAttention disabled)...")
+        vla = AutoModelForVision2Seq.from_pretrained(
+            MODEL_PATH,
+            torch_dtype=torch.bfloat16,
+            quantization_config=BitsAndBytesConfig(load_in_8bit=True),
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+
+    else:
+        raise ValueError(f"Unknown quantization mode: {quantize}")
 
     base_prompt = get_openvla_prompt(INSTRUCTION)
     print(f"[*] Base prompt template: {base_prompt}")
@@ -131,9 +160,9 @@ def benchmark_prefill_decode(use_pipe: bool = False):
     results: Dict[Tuple[int, int], dict] = {}
 
     for prefill_len in PREFILL_LENGTHS:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Testing Prefill Length (text tokens): {prefill_len}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Construct prompt with target token count
         prompt_text = construct_prompt_by_token_length(base_prompt, prefill_len, processor.tokenizer)
@@ -255,7 +284,14 @@ if __name__ == "__main__":
         type=int,
         default=0,
         choices=[0, 1],
-        help="Use ActionFlow acceleration pipeline (1 = True, 0 = False)"
+        help="Use ActionFlow acceleration pipeline (1 = True, 0 = False)",
+    )
+    parser.add_argument(
+        "--quantize",
+        type=str,
+        default="bf16",
+        choices=["bf16", "int4", "int8"],
+        help="Quantization mode: bf16 (default), int4, or int8",
     )
     args = parser.parse_args()
 
@@ -267,4 +303,4 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(SEED)
 
     # Run benchmark
-    benchmark_prefill_decode(use_pipe=bool(args.use_pipe))
+    benchmark_prefill_decode(use_pipe=bool(args.use_pipe), quantize=args.quantize)
