@@ -22,7 +22,8 @@ from .modeling.qwen_pipeline import ActionFlowQwenPipeline
 def enable_actionflow_qwen(
     vla_model,
     max_new_tokens: int = 35,
-    enable_timing: bool = False
+    enable_timing: bool = False,
+    rope_position_mode: str = "model",
 ):
     """
     Enable ActionFlow acceleration on a VLA-0 (Qwen2.5-VL) model.
@@ -43,6 +44,7 @@ def enable_actionflow_qwen(
     # Attach to model
     vla_model.actionflow_engine = pipeline_engine
     vla_model._enable_timing = enable_timing
+    vla_model._rope_position_mode = rope_position_mode
     vla_model._af_max_new_tokens = max_new_tokens
 
     if enable_timing:
@@ -97,6 +99,8 @@ def enable_actionflow_qwen(
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        rope_position_mode: Optional[str] = None,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -128,12 +132,55 @@ def enable_actionflow_qwen(
         max_new_tokens = self._af_max_new_tokens
         self.actionflow_engine.init_resources(prefill_len=prefill_len, max_new_tokens=max_new_tokens)
 
+        if rope_position_mode is None:
+            rope_position_mode = self._rope_position_mode
+
+        if (
+            position_ids is None
+            and rope_position_mode == "model"
+            and hasattr(self, "get_rope_index")
+        ):
+            # Prefer model-native position construction for Qwen mRoPE when available.
+            try:
+                computed_position_ids, _ = self.get_rope_index(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    attention_mask=attention_mask,
+                )
+                position_ids = computed_position_ids
+            except TypeError:
+                # Different transformers/trust_remote_code versions may use positional args.
+                try:
+                    computed_position_ids, _ = self.get_rope_index(
+                        input_ids,
+                        image_grid_thw,
+                        attention_mask,
+                    )
+                    position_ids = computed_position_ids
+                except Exception:
+                    position_ids = None
+            except Exception:
+                position_ids = None
+
+        if position_ids is None and rope_position_mode == "sequential":
+            # For current Triton kernel path, sequential text positions are the most stable.
+            position_ids = torch.arange(
+                prefill_len,
+                device=input_ids.device,
+                dtype=torch.long,
+            ).unsqueeze(0)
+
         # Step 3: Run pipeline forward
         if self._enable_timing:
             torch.cuda.synchronize()
         llm_start = time.perf_counter()
 
-        output_ids = self.actionflow_engine.pipe_forward(inputs_embeds)
+        output_ids = self.actionflow_engine.pipe_forward(
+            inputs_embeds,
+            position_ids=position_ids,
+            rope_position_mode=rope_position_mode,
+            prefill_input_ids=input_ids,
+        )
 
         if self._enable_timing:
             torch.cuda.synchronize()

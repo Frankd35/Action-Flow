@@ -47,32 +47,32 @@ def verify_openvla() -> None:
     processor = AutoProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
 
     # # === BFLOAT16 + FLASH-ATTN MODE ===
-    # print("[*] Loading in BF16 with Flash-Attention Enabled")
-    # vla = AutoModelForVision2Seq.from_pretrained(
-    #     MODEL_PATH,
-    #     attn_implementation="flash_attention_2",
-    #     torch_dtype=torch.bfloat16,
-    #     low_cpu_mem_usage=True,
-    #     trust_remote_code=True,
-    # ).to(device)
-
-    # === 4-BIT QUANTIZATION MODE (`pip install bitsandbytes`) + FLASH-ATTN :: [~6GB VRAM] ===
-    print("[*] Loading in 4-Bit Quantization Mode with Flash-Attention")
+    print("[*] Loading in BF16 with Flash-Attention Enabled")
     vla = AutoModelForVision2Seq.from_pretrained(
         MODEL_PATH,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-        ),
         low_cpu_mem_usage=True,
         trust_remote_code=True,
-    )
+    ).to(device)
+
+    # === 4-BIT QUANTIZATION MODE (`pip install bitsandbytes`) + FLASH-ATTN :: [~6GB VRAM] ===
+    # print("[*] Loading in 4-Bit Quantization Mode with Flash-Attention")
+    # vla = AutoModelForVision2Seq.from_pretrained(
+    #     MODEL_PATH,
+    #     attn_implementation="flash_attention_2",
+    #     torch_dtype=torch.bfloat16,
+    #     quantization_config=BitsAndBytesConfig(
+    #         load_in_4bit=True,
+    #         bnb_4bit_compute_dtype=torch.bfloat16,
+    #         bnb_4bit_quant_type="nf4",
+    #     ),
+    #     low_cpu_mem_usage=True,
+    #     trust_remote_code=True,
+    # )
 
     print("[*] Injecting ActionFlow Acceleration...")
-    vla = enable_actionflow(vla, max_new_tokens=7)
+    # vla = enable_actionflow(vla, max_new_tokens=7)
 
     prompt = get_openvla_prompt(INSTRUCTION)
 

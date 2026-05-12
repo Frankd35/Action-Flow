@@ -180,18 +180,18 @@ def fused_rope_write_kv_kernel(
     cos1_ptr = cos_ptr + pos * stride_cos_l + D_half + offsets_d_half
     sin1_ptr = sin_ptr + pos * stride_sin_l + D_half + offsets_d_half
 
-    cos0 = tl.load(cos0_ptr, mask=offsets_d_half < D_half)
-    sin0 = tl.load(sin0_ptr, mask=offsets_d_half < D_half)
-    cos1 = tl.load(cos1_ptr, mask=offsets_d_half < D_half)
-    sin1 = tl.load(sin1_ptr, mask=offsets_d_half < D_half)
+    cos0 = tl.load(cos0_ptr, mask=offsets_d_half < D_half).to(tl.float32)
+    sin0 = tl.load(sin0_ptr, mask=offsets_d_half < D_half).to(tl.float32)
+    cos1 = tl.load(cos1_ptr, mask=offsets_d_half < D_half).to(tl.float32)
+    sin1 = tl.load(sin1_ptr, mask=offsets_d_half < D_half).to(tl.float32)
 
     # Apply RoPE to Q if head exists
     if h_idx < H_q:
         q_ptr = Q_new_ptr + tok_idx * stride_ql + h_idx * stride_qh
         q_out_ptr = Q_out_ptr + tok_idx * stride_qo_l + h_idx * stride_qo_h
 
-        q0 = tl.load(q_ptr + offsets_d_half, mask=offsets_d_half < D_half)
-        q1 = tl.load(q_ptr + D_half + offsets_d_half, mask=offsets_d_half < D_half)
+        q0 = tl.load(q_ptr + offsets_d_half, mask=offsets_d_half < D_half).to(tl.float32)
+        q1 = tl.load(q_ptr + D_half + offsets_d_half, mask=offsets_d_half < D_half).to(tl.float32)
 
         out0 = q0 * cos0 - q1 * sin0
         out1 = q1 * cos1 + q0 * sin1
@@ -210,8 +210,8 @@ def fused_rope_write_kv_kernel(
             + h_idx * stride_ring_h
         )
 
-        k0 = tl.load(k_ptr + offsets_d_half, mask=offsets_d_half < D_half)
-        k1 = tl.load(k_ptr + D_half + offsets_d_half, mask=offsets_d_half < D_half)
+        k0 = tl.load(k_ptr + offsets_d_half, mask=offsets_d_half < D_half).to(tl.float32)
+        k1 = tl.load(k_ptr + D_half + offsets_d_half, mask=offsets_d_half < D_half).to(tl.float32)
 
         k_rot0 = k0 * cos0 - k1 * sin0
         k_rot1 = k1 * cos1 + k0 * sin1
@@ -304,6 +304,233 @@ def fused_rope_write_kv_wrapper(
         stride_ring_h=kv_ring_buffer.stride(2),
         stride_cos_l=cos.stride(0),
         stride_sin_l=sin.stride(0),
+        BLOCK_D=D,
+        D_half=D_half,
+        H_q=H_q,
+        H_kv=H_kv,
+    )
+
+
+# ==============================================================================
+# Qwen mRoPE (3D + section) fused RoPE + write KV
+# ==============================================================================
+
+_QWEN_MROPE_DIM_SOURCE_MAP_CACHE = {}
+
+
+@triton.jit
+def fused_qwen_mrope_write_kv_kernel(
+    Q_new_ptr,
+    K_new_ptr,
+    V_new_ptr,
+    Q_out_ptr,
+    kv_ring_ptr,
+    cos_ptr,  # (3, L, D)
+    sin_ptr,  # (3, L, D)
+    dim_source_map_ptr,  # (D,), values in {0,1,2}
+    total_L_q: tl.int32,
+    total_max_L: tl.int32,
+    prefill_len: tl.int32,
+    D: tl.int32,
+    stride_ql: tl.int32,
+    stride_qh: tl.int32,
+    stride_kl: tl.int32,
+    stride_kh: tl.int32,
+    stride_vl: tl.int32,
+    stride_vh: tl.int32,
+    stride_qo_l: tl.int32,
+    stride_qo_h: tl.int32,
+    stride_ring_k_dim: tl.int32,
+    stride_ring_seq: tl.int32,
+    stride_ring_h: tl.int32,
+    stride_cos_m: tl.int32,
+    stride_cos_l: tl.int32,
+    stride_sin_m: tl.int32,
+    stride_sin_l: tl.int32,
+    BLOCK_D: tl.constexpr,
+    D_half: tl.constexpr,
+    H_q: tl.constexpr,
+    H_kv: tl.constexpr,
+):
+    tok_idx = tl.program_id(0)
+    h_idx = tl.program_id(1)
+
+    if h_idx >= H_q and h_idx >= H_kv:
+        return
+
+    pos = 0
+    cu_seqlens_k_base = 0
+    if tok_idx < prefill_len:
+        pos = tok_idx
+        cu_seqlens_k_base = 0
+    else:
+        decode_idx = tok_idx - prefill_len
+        stage_idx = decode_idx + 1
+        pos = prefill_len + decode_idx
+        cu_seqlens_k_base = stage_idx * prefill_len + (stage_idx * (stage_idx - 1) // 2)
+
+    varlen_write_idx = cu_seqlens_k_base + pos
+
+    offsets_d_half = tl.arange(0, D_half)
+    offsets_d = tl.arange(0, BLOCK_D)
+    mask_half = offsets_d_half < D_half
+    mask_full = offsets_d < D
+
+    d0 = offsets_d_half
+    d1 = D_half + offsets_d_half
+    src0 = tl.load(dim_source_map_ptr + d0, mask=mask_half, other=0).to(tl.int32)
+    src1 = tl.load(dim_source_map_ptr + d1, mask=mask_half, other=0).to(tl.int32)
+
+    cos0_ptr = cos_ptr + src0 * stride_cos_m + pos * stride_cos_l + d0
+    sin0_ptr = sin_ptr + src0 * stride_sin_m + pos * stride_sin_l + d0
+    cos1_ptr = cos_ptr + src1 * stride_cos_m + pos * stride_cos_l + d1
+    sin1_ptr = sin_ptr + src1 * stride_sin_m + pos * stride_sin_l + d1
+
+    cos0 = tl.load(cos0_ptr, mask=mask_half, other=1.0).to(tl.float32)
+    sin0 = tl.load(sin0_ptr, mask=mask_half, other=0.0).to(tl.float32)
+    cos1 = tl.load(cos1_ptr, mask=mask_half, other=1.0).to(tl.float32)
+    sin1 = tl.load(sin1_ptr, mask=mask_half, other=0.0).to(tl.float32)
+
+    if h_idx < H_q:
+        q_ptr = Q_new_ptr + tok_idx * stride_ql + h_idx * stride_qh
+        q_out_ptr = Q_out_ptr + tok_idx * stride_qo_l + h_idx * stride_qo_h
+
+        q0 = tl.load(q_ptr + d0, mask=mask_half, other=0.0).to(tl.float32)
+        q1 = tl.load(q_ptr + d1, mask=mask_half, other=0.0).to(tl.float32)
+
+        out0 = q0 * cos0 - q1 * sin0
+        out1 = q1 * cos1 + q0 * sin1
+
+        tl.store(q_out_ptr + d0, out0, mask=mask_half)
+        tl.store(q_out_ptr + d1, out1, mask=mask_half)
+
+    if h_idx < H_kv:
+        k_ptr = K_new_ptr + tok_idx * stride_kl + h_idx * stride_kh
+        k_out_ptr = (
+            kv_ring_ptr
+            + 0 * stride_ring_k_dim
+            + varlen_write_idx * stride_ring_seq
+            + h_idx * stride_ring_h
+        )
+
+        k0 = tl.load(k_ptr + d0, mask=mask_half, other=0.0).to(tl.float32)
+        k1 = tl.load(k_ptr + d1, mask=mask_half, other=0.0).to(tl.float32)
+        k_rot0 = k0 * cos0 - k1 * sin0
+        k_rot1 = k1 * cos1 + k0 * sin1
+        tl.store(k_out_ptr + d0, k_rot0, mask=mask_half)
+        tl.store(k_out_ptr + d1, k_rot1, mask=mask_half)
+
+        v_ptr = V_new_ptr + tok_idx * stride_vl + h_idx * stride_vh
+        v_out_ptr = (
+            kv_ring_ptr
+            + 1 * stride_ring_k_dim
+            + varlen_write_idx * stride_ring_seq
+            + h_idx * stride_ring_h
+        )
+        v = tl.load(v_ptr + offsets_d, mask=mask_full, other=0.0)
+        tl.store(v_out_ptr + offsets_d, v, mask=mask_full)
+
+
+def _get_qwen_mrope_dim_source_map(
+    device: torch.device,
+    dtype: torch.dtype,
+    D: int,
+    mrope_section,
+) -> torch.Tensor:
+    sections = [int(x) for x in mrope_section]
+    sections_6 = sections * 2
+    if sum(sections_6) != D:
+        raise ValueError(
+            f"Invalid mrope_section {sections} for head_dim {D}; "
+            f"sum(section*2)={sum(sections_6)} must equal D"
+        )
+    key = (str(device), D, tuple(sections))
+    cached = _QWEN_MROPE_DIM_SOURCE_MAP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    source_map = []
+    for i, span in enumerate(sections_6):
+        source_map.extend([i % 3] * span)
+    source_map_t = torch.tensor(source_map, device=device, dtype=torch.int32)
+    _QWEN_MROPE_DIM_SOURCE_MAP_CACHE[key] = source_map_t
+    return source_map_t
+
+
+def fused_qwen_mrope_write_kv_wrapper(
+    Q_new: torch.Tensor,
+    K_new: torch.Tensor,
+    V_new: torch.Tensor,
+    kv_ring_buffer: torch.Tensor,
+    cos: torch.Tensor,  # (3, L, D)
+    sin: torch.Tensor,  # (3, L, D)
+    mrope_section,
+    prefill_len: int,
+    q_varlen: torch.Tensor,
+):
+    B, L_q, H_q, D = Q_new.shape
+    assert B == 1, "Batch size must be 1"
+    _, _, H_kv, D2 = K_new.shape
+    assert D == D2 and D % 2 == 0, "D must match and be even"
+    assert cos.dim() == 3 and sin.dim() == 3, "Qwen mRoPE expects cos/sin shape (3, L, D)"
+    assert cos.shape[0] == 3 and sin.shape[0] == 3, "Qwen mRoPE expects 3 rope dimensions"
+    assert cos.shape[1] >= L_q and sin.shape[1] >= L_q, "cos/sin length insufficient for current sequence"
+    assert cos.shape[2] == D and sin.shape[2] == D, "cos/sin head_dim mismatch"
+
+    D_half = D // 2
+    decode_steps = L_q - prefill_len
+    B_stages = decode_steps + 1
+    total_L_kv_calc = B_stages * prefill_len + (B_stages - 1) * B_stages // 2
+
+    _, total_L_kv_buffer, H_kv2, D3 = kv_ring_buffer.shape
+    assert kv_ring_buffer.shape[0] == 2 and H_kv == H_kv2 and D == D3
+    assert total_L_kv_calc == total_L_kv_buffer, (
+        f"KV buffer length mismatch: expected {total_L_kv_calc}, got {total_L_kv_buffer}"
+    )
+
+    Q_new_in = Q_new.squeeze(0).contiguous()
+    K_new_in = K_new.squeeze(0).contiguous()
+    V_new_in = V_new.squeeze(0).contiguous()
+    cos_in = cos[:, :L_q, :].contiguous()
+    sin_in = sin[:, :L_q, :].contiguous()
+    dim_source_map = _get_qwen_mrope_dim_source_map(
+        device=Q_new.device,
+        dtype=Q_new.dtype,
+        D=D,
+        mrope_section=mrope_section,
+    )
+
+    assert q_varlen.is_contiguous() and kv_ring_buffer.is_contiguous()
+
+    grid = (L_q, max(H_q, H_kv))
+    fused_qwen_mrope_write_kv_kernel[grid](
+        Q_new_ptr=Q_new_in,
+        K_new_ptr=K_new_in,
+        V_new_ptr=V_new_in,
+        Q_out_ptr=q_varlen,
+        kv_ring_ptr=kv_ring_buffer,
+        cos_ptr=cos_in,
+        sin_ptr=sin_in,
+        dim_source_map_ptr=dim_source_map,
+        total_L_q=L_q,
+        total_max_L=total_L_kv_buffer,
+        prefill_len=prefill_len,
+        D=D,
+        stride_ql=Q_new_in.stride(0),
+        stride_qh=Q_new_in.stride(1),
+        stride_kl=K_new_in.stride(0),
+        stride_kh=K_new_in.stride(1),
+        stride_vl=V_new_in.stride(0),
+        stride_vh=V_new_in.stride(1),
+        stride_qo_l=q_varlen.stride(0),
+        stride_qo_h=q_varlen.stride(1),
+        stride_ring_k_dim=kv_ring_buffer.stride(0),
+        stride_ring_seq=kv_ring_buffer.stride(1),
+        stride_ring_h=kv_ring_buffer.stride(2),
+        stride_cos_m=cos_in.stride(0),
+        stride_cos_l=cos_in.stride(1),
+        stride_sin_m=sin_in.stride(0),
+        stride_sin_l=sin_in.stride(1),
         BLOCK_D=D,
         D_half=D_half,
         H_q=H_q,

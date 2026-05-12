@@ -14,7 +14,12 @@ try:
 except ImportError:
     HAS_BNB = False
 
-from actionflow.kernels.ops import TritonLlamaRMSNorm, fused_rope_write_kv_wrapper, shift_varlen_kv_cache_wrapper
+from actionflow.kernels.ops import (
+    TritonLlamaRMSNorm,
+    fused_rope_write_kv_wrapper,
+    fused_qwen_mrope_write_kv_wrapper,
+    shift_varlen_kv_cache_wrapper,
+)
 
 
 class QwenPIPEDecodeLayer(nn.Module):
@@ -52,6 +57,8 @@ class QwenPIPEDecodeLayer(nn.Module):
 
         self.post_attention_layernorm = TritonLlamaRMSNorm(config.hidden_size, eps=eps)
         self.post_attention_layernorm.weight = original_layer.post_attention_layernorm.weight
+        rope_scaling = getattr(config, "rope_scaling", None)
+        self.mrope_section = rope_scaling.get("mrope_section") if isinstance(rope_scaling, dict) else None
 
     def _optimized_linear(self, layer, x):
         """BNB INT4 optimization."""
@@ -74,7 +81,6 @@ class QwenPIPEDecodeLayer(nn.Module):
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-        **kwargs,
     ):
         """
         Execute packed forward pass for Qwen layer.
@@ -111,18 +117,47 @@ class QwenPIPEDecodeLayer(nn.Module):
         q_varlen = torch.empty_like(queries.squeeze(0))
         cos_full, sin_full = global_position_embeddings
         prefill_len = seq_lens[0]
-
-        # Apply RoPE and write KV to ring buffer
-        fused_rope_write_kv_wrapper(
-            Q_new=queries,
-            K_new=keys,
-            V_new=values,
-            kv_ring_buffer=kv_ring_buffer,
-            cos=cos_full.squeeze(0),
-            sin=sin_full.squeeze(0),
-            prefill_len=prefill_len,
-            q_varlen=q_varlen
-        )
+        if cos_full.dim() == 3 and sin_full.dim() == 3:
+            if self.mrope_section is None:
+                raise RuntimeError(
+                    "Received 3D mRoPE tensors but config.rope_scaling.mrope_section is missing"
+                )
+            if cos_full.shape[1] != L or sin_full.shape[1] != L:
+                raise RuntimeError(
+                    f"mRoPE length mismatch: cos/sin={cos_full.shape[1]}/{sin_full.shape[1]} vs total_L={L}"
+                )
+            fused_qwen_mrope_write_kv_wrapper(
+                Q_new=queries,
+                K_new=keys,
+                V_new=values,
+                kv_ring_buffer=kv_ring_buffer,
+                cos=cos_full,
+                sin=sin_full,
+                mrope_section=self.mrope_section,
+                prefill_len=prefill_len,
+                q_varlen=q_varlen,
+            )
+        else:
+            if cos_full.dim() != 2 or sin_full.dim() != 2:
+                raise RuntimeError(
+                    f"Expected 2D or 3D rope tensors for Triton kernel, got "
+                    f"cos={tuple(cos_full.shape)}, sin={tuple(sin_full.shape)}"
+                )
+            if cos_full.shape[0] != L or sin_full.shape[0] != L:
+                raise RuntimeError(
+                    f"RoPE length mismatch: cos/sin={cos_full.shape[0]}/{sin_full.shape[0]} vs total_L={L}"
+                )
+            # Apply RoPE and write KV to ring buffer
+            fused_rope_write_kv_wrapper(
+                Q_new=queries,
+                K_new=keys,
+                V_new=values,
+                kv_ring_buffer=kv_ring_buffer,
+                cos=cos_full.squeeze(0),
+                sin=sin_full.squeeze(0),
+                prefill_len=prefill_len,
+                q_varlen=q_varlen
+            )
 
         # Step 4: Flash Attention Varlen
         k_varlen = kv_ring_buffer[0]
