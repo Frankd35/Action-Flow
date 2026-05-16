@@ -23,17 +23,27 @@ Based on the provided codebase, the project is organized into the core `actionfl
 ```text
 ActionFlow/
 ├── actionflow/                # Core Acceleration Engine
-│   ├── integration.py         # [API] Injection entry point (contains `enable_actionflow`)
+│   ├── integration.py         # [API] OpenVLA injection entry point (contains `enable_actionflow`)
+│   ├── integration_qwen.py    # [API] VLA-0 (Qwen2.5-VL) injection entry point (contains `enable_actionflow_qwen`)
 │   ├── kernels/               # [Backend] Custom Triton Kernels
 │   │   └── ops.py             # Fused RoPE+WriteKV, RMSNorm, RingBuffer Shift kernels
 │   └── modeling/              # [Core] Pipeline orchestration & Layer wrapping
 │       ├── layers.py          # Zero-Copy Layer Wrappers (LlamaPIPEDecodeLayer)
-│       └── pipeline.py        # Macro-Pipeline Scheduler (ActionFlowPipeline)
+│       ├── pipeline.py        # Macro-Pipeline Scheduler (ActionFlowPipeline)
+│       ├── qwen_layers.py     # Qwen2.5-VL Layer Wrappers (QwenPIPEDecodeLayer)
+│       └── qwen_pipeline.py   # Qwen2.5-VL Pipeline (ActionFlowQwenPipeline)
 ├── vla-scripts/
 │   └── extern/                # Experiment & Validation Scripts
 │       ├── verify_openvla.py  # Functional verification: Consistency check against baseline
-│       └── benchmark.py       # Performance benchmarking: Latency & FPS profiling
-└── ...
+│       ├── benchmark.py       # Performance benchmarking: Latency & FPS profiling
+│       └── perf_vla0.py       # VLA-0 performance testing (native vs ActionFlow)
+├── experiments/
+│   └── robot/
+│       └── libero/            # LIBERO evaluation scripts
+│           ├── run_libero_eval.py    # OpenVLA LIBERO eval
+│           ├── run_vla0_libero_eval.py  # VLA-0 LIBERO eval with ActionFlow
+│           └── libero_requirements.txt
+└── pyproject.toml             # Includes `[project.optional-dependencies] vla0 = ["qwen-vl-utils"]`
 ```
 
 ## 🛠️ Installation
@@ -74,6 +84,54 @@ Once inside the container or environment, install the ActionFlow engine:
 ```bash
 cd ActionFlow
 pip install -e .
+```
+
+### VLA-0 (Qwen2.5-VL) Extra Setup
+
+ActionFlow also supports VLA-0, a Qwen2.5-VL based policy. This is an additional option on top of **either** the Jetson or GPU Server environment above.
+
+```bash
+# Install VLA-0 extra dependency (qwen-vl-utils for vision processing)
+pip install qwen-vl-utils
+
+# Clone VLA-0 training/inference code
+git clone <vla0-repo> /path/to/vla0
+# Clone RoboVerse (LIBERO evaluation harness)
+git clone <roboverse-repo> /path/to/vla0/libs/RoboVerse
+
+# For LIBERO evaluation, install simulation dependencies
+pip install imageio[ffmpeg] robosuite==1.4.1 bddl easydict cloudpickle gym
+```
+
+**Model Checkpoint**: Download a VLA-0 checkpoint (e.g., `ankgoyal/vla0-libero` from HuggingFace Hub) and set the path:
+
+```bash
+export VLA0_MODEL_PATH=/path/to/vla0-checkpoint
+```
+
+**Environment Variables**: The VLA-0 eval scripts need the following paths in `PYTHONPATH`:
+
+```bash
+export PYTHONPATH=/path/to/ActionFlow:/path/to/vla0:/path/to/vla0/libs/RoboVerse:$PYTHONPATH
+```
+
+For LIBERO simulation, also set:
+```bash
+export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+```
+
+**Run Performance Test**:
+```bash
+python vla-scripts/extern/perf_vla0.py --mode actionflow
+```
+
+**Run LIBERO Evaluation**:
+```bash
+python experiments/robot/libero/run_vla0_libero_eval.py \
+    --pretrained_checkpoint /path/to/vla0-checkpoint \
+    --task_suite_name libero_spatial \
+    --actionflow_K 35 \
+    --seed 7
 ```
 
 ## ⚡ Quick Start

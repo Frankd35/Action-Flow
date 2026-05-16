@@ -253,15 +253,11 @@ def test_actionflow(device, rope_position_mode="model"):
     print(f"  Warming up pipeline (K={MAX_NEW_TOKENS} calls)...")
     last_output = None
     for _ in range(MAX_NEW_TOKENS):
-        last_output = model.generate_accelerated(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            attention_mask=inputs.get("attention_mask"),
-        )
+        last_output = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
     torch.cuda.synchronize()
 
-    action_text = processor.decode(last_output[0], skip_special_tokens=True)
+    generated_ids = last_output[:, inputs["input_ids"].shape[1]:]
+    action_text = processor.decode(generated_ids[0], skip_special_tokens=True)
     action = parse_action_text(action_text)
     print(f"  Warm-up complete. action={action[:7]}")
 
@@ -269,17 +265,13 @@ def test_actionflow(device, rope_position_mode="model"):
     times = []
     for i in range(NUM_RUNS):
         start = time.perf_counter()
-        output_ids = model.generate_accelerated(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            attention_mask=inputs.get("attention_mask"),
-        )
+        output_ids = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         times.append(elapsed)
 
-        action_text = processor.decode(output_ids[0], skip_special_tokens=True)
+        generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
+        action_text = processor.decode(generated_ids[0], skip_special_tokens=True)
         action = parse_action_text(action_text)
         print(f"  Run {i + 1}: {elapsed:.3f}s, action={action[:7]}")
 
@@ -356,7 +348,6 @@ def debug_output_alignment(
         model_af,
         max_new_tokens=MAX_NEW_TOKENS,
         enable_timing=False,
-        enable_debug_trace=debug_trace,
         rope_position_mode=rope_position_mode,
     )
     af_eos_ids = normalize_eos_ids(model_af.generation_config.eos_token_id)
@@ -365,13 +356,7 @@ def debug_output_alignment(
         print(f"  AF warm-up {MAX_NEW_TOKENS} rounds before collection...")
     warm_inputs = prepare_inputs_with_image(processor_af, INSTRUCTION, device, images[0])
     for _ in range(MAX_NEW_TOKENS):
-        _ = model_af.generate_accelerated(
-            input_ids=warm_inputs["input_ids"],
-            pixel_values=warm_inputs.get("pixel_values"),
-            image_grid_thw=warm_inputs.get("image_grid_thw"),
-            attention_mask=warm_inputs.get("attention_mask"),
-            debug_trace=debug_trace,
-        )
+        _ = model_af.generate(**warm_inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
 
     af_actions_by_round = {}
     af_tokens_by_round = {}
@@ -380,13 +365,8 @@ def debug_output_alignment(
     for r in range(total_af_rounds):
         image = images[r]
         inputs = prepare_inputs_with_image(processor_af, INSTRUCTION, device, image)
-        output_ids = model_af.generate_accelerated(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs.get("pixel_values"),
-            image_grid_thw=inputs.get("image_grid_thw"),
-            attention_mask=inputs.get("attention_mask"),
-            debug_trace=debug_trace,
-        )
+        full_output_ids = model_af.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False)
+        output_ids = full_output_ids[:, inputs["input_ids"].shape[1]:]
 
         af_tokens_by_round[r] = output_ids[0].detach().cpu()
         af_token_stats_by_round[r] = analyze_generated_tokens(output_ids[0], af_eos_ids)

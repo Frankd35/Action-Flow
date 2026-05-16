@@ -12,9 +12,8 @@ For ActionFlow:
 """
 import torch
 import types
-import time
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional
 
 from .modeling.qwen_pipeline import ActionFlowQwenPipeline
 
@@ -93,112 +92,67 @@ def enable_actionflow_qwen(
 
         return inputs_embeds
 
-    def generate_accelerated(
-        self,
-        input_ids: torch.Tensor,
-        pixel_values: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        rope_position_mode: Optional[str] = None,
-        **kwargs
-    ) -> torch.Tensor:
+    def patched_generate(self, **kwargs):
         """
-        Accelerated generation using ActionFlow pipeline.
+        ActionFlow-accelerated generate (replaces model.generate).
+
+        Extracts inputs from HF generate kwargs, builds logit_mask from
+        logits_processor, and runs the ActionFlow pipeline.
 
         Returns:
-            output_ids: Generated token IDs (1, max_new_tokens)
+            torch.Tensor: [input_ids | generated_ids] matching HF generate convention.
         """
-        if self._enable_timing:
-            torch.cuda.synchronize()
-        total_start = time.perf_counter()
+        input_ids = kwargs["input_ids"]
+        pixel_values = kwargs.get("pixel_values")
+        image_grid_thw = kwargs.get("image_grid_thw")
+        attention_mask = kwargs.get("attention_mask")
+        logits_processor = kwargs.get("logits_processor")
+        position_ids = kwargs.get("position_ids")
+        rope_mode = kwargs.get("rope_position_mode", self._rope_position_mode)
 
-        device = input_ids.device
+        # Build logit_mask from logits_processor
+        logit_mask = None
+        if logits_processor is not None:
+            vocab_size = self.config.vocab_size
+            dummy_ids = torch.zeros(1, 1, dtype=torch.long, device=input_ids.device)
+            dummy_scores = torch.zeros(1, vocab_size, device=input_ids.device)
+            for p in logits_processor:
+                dummy_scores = p(dummy_ids, dummy_scores)
+            logit_mask = dummy_scores[0, :]  # (vocab_size,)
 
-        # Step 1: Compute multimodal embeddings
-        if self._enable_timing:
-            torch.cuda.synchronize()
-        embed_start = time.perf_counter()
-
+        # Compute multimodal embeddings
         inputs_embeds = self.get_multimodal_embeddings(input_ids, pixel_values, image_grid_thw)
-
-        if self._enable_timing:
-            torch.cuda.synchronize()
-            embed_elapsed = (time.perf_counter() - embed_start) * 1000
-            self._timing_stats["embed"].append(embed_elapsed)
-
-        # Step 2: Initialize pipeline resources
         prefill_len = inputs_embeds.shape[1]
-        max_new_tokens = self._af_max_new_tokens
-        self.actionflow_engine.init_resources(prefill_len=prefill_len, max_new_tokens=max_new_tokens)
 
-        if rope_position_mode is None:
-            rope_position_mode = self._rope_position_mode
+        # Initialize pipeline
+        self.actionflow_engine.init_resources(prefill_len, max_new_tokens=self._af_max_new_tokens)
 
-        if (
-            position_ids is None
-            and rope_position_mode == "model"
-            and hasattr(self, "get_rope_index")
-        ):
-            # Prefer model-native position construction for Qwen mRoPE when available.
-            try:
-                computed_position_ids, _ = self.get_rope_index(
-                    input_ids=input_ids,
-                    image_grid_thw=image_grid_thw,
-                    attention_mask=attention_mask,
-                )
-                position_ids = computed_position_ids
-            except TypeError:
-                # Different transformers/trust_remote_code versions may use positional args.
-                try:
-                    computed_position_ids, _ = self.get_rope_index(
-                        input_ids,
-                        image_grid_thw,
-                        attention_mask,
-                    )
-                    position_ids = computed_position_ids
-                except Exception:
-                    position_ids = None
-            except Exception:
-                position_ids = None
+        # Position IDs
+        if position_ids is None and rope_mode == "model" and hasattr(self, "get_rope_index"):
+            position_ids, _ = self.get_rope_index(input_ids, image_grid_thw, attention_mask)
+        if position_ids is None:
+            position_ids = torch.arange(prefill_len, device=input_ids.device, dtype=torch.long).unsqueeze(0)
 
-        if position_ids is None and rope_position_mode == "sequential":
-            # For current Triton kernel path, sequential text positions are the most stable.
-            position_ids = torch.arange(
-                prefill_len,
-                device=input_ids.device,
-                dtype=torch.long,
-            ).unsqueeze(0)
-
-        # Step 3: Run pipeline forward
-        if self._enable_timing:
-            torch.cuda.synchronize()
-        llm_start = time.perf_counter()
-
+        # Run pipeline forward
         output_ids = self.actionflow_engine.pipe_forward(
             inputs_embeds,
             position_ids=position_ids,
-            rope_position_mode=rope_position_mode,
+            rope_position_mode=rope_mode,
             prefill_input_ids=input_ids,
+            logit_mask=logit_mask,
         )
 
-        if self._enable_timing:
-            torch.cuda.synchronize()
-            llm_elapsed = (time.perf_counter() - llm_start) * 1000
-            self._timing_stats["llm_actionflow"].append(llm_elapsed)
-
-        if self._enable_timing:
-            torch.cuda.synchronize()
-            total_elapsed = (time.perf_counter() - total_start) * 1000
-            self._timing_stats["total"].append(total_elapsed)
-
-        return output_ids
+        # Return [input_ids | generated] matching HF generate convention
+        return torch.cat([input_ids, output_ids.to(device=input_ids.device, dtype=input_ids.dtype)], dim=1)
 
     # Bind methods
     vla_model.get_multimodal_embeddings = types.MethodType(get_multimodal_embeddings, vla_model)
-    vla_model.generate_accelerated = types.MethodType(generate_accelerated, vla_model)
 
-    print(f"[ActionFlow-Qwen] `generate_accelerated` ready (K={max_new_tokens})")
+    # Save original and replace model.generate
+    vla_model._original_generate = vla_model.generate
+    vla_model.generate = types.MethodType(patched_generate, vla_model)
+
+    print(f"[ActionFlow-Qwen] `model.generate` patched with ActionFlow pipeline (K={max_new_tokens})")
     return vla_model
 
 

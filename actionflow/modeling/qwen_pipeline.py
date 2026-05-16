@@ -1,6 +1,8 @@
 """
 Qwen2.5-VL Action-Flow Pipeline Implementation
 """
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -227,6 +229,7 @@ class ActionFlowQwenPipeline(nn.Module):
         position_ids: torch.Tensor = None,
         rope_position_mode: str = "sequential",
         prefill_input_ids: torch.Tensor = None,
+        logit_mask: Optional[torch.Tensor] = None,
     ):
         """
         Execute pipeline forward pass.
@@ -368,6 +371,8 @@ class ActionFlowQwenPipeline(nn.Module):
                 history_ids=history_ids,
                 repetition_penalty=float(repetition_penalty) if repetition_penalty is not None else 1.0,
             )
+            if logit_mask is not None:
+                logits_last = logits_last + logit_mask.to(device=logits_last.device, dtype=logits_last.dtype)
             token_id = torch.argmax(logits_last, dim=-1)
             stage_token_ids_this_round.append(int(token_id.detach().cpu().item()))
 
