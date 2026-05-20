@@ -148,6 +148,7 @@ dmypy.json
 cache/
 data/
 
-# Rollout videos and wandb logs
+# Rollout videos, wandb logs, and eval logs
 rollouts/
 wandb/
+experiments/logs/

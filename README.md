@@ -41,7 +41,7 @@ ActionFlow/
 │   └── robot/
 │       └── libero/            # LIBERO evaluation scripts
 │           ├── run_libero_eval.py    # OpenVLA LIBERO eval
-│           ├── run_vla0_libero_eval.py  # VLA-0 LIBERO eval with ActionFlow
+│           ├── run_vla0_libero_eval.py  # VLA-0 LIBERO eval (--use_pipe True/False)
 │           └── libero_requirements.txt
 └── pyproject.toml             # Includes `[project.optional-dependencies] vla0 = ["qwen-vl-utils"]`
 ```
@@ -125,13 +125,20 @@ export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 python vla-scripts/extern/perf_vla0.py --mode actionflow
 ```
 
-**Run LIBERO Evaluation**:
+**Run LIBERO Evaluation**
+
 ```bash
+# Native (standard autoregressive)
 python experiments/robot/libero/run_vla0_libero_eval.py \
-    --pretrained_checkpoint /path/to/vla0-checkpoint \
     --task_suite_name libero_spatial \
-    --actionflow_K 35 \
-    --seed 7
+    --num_trials_per_task 3 \
+    --use_pipe False
+
+# ActionFlow (pipeline accelerated)
+python experiments/robot/libero/run_vla0_libero_eval.py \
+    --task_suite_name libero_spatial \
+    --num_trials_per_task 3 \
+    --use_pipe True
 ```
 
 ## ⚡ Quick Start
