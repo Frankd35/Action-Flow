@@ -29,7 +29,7 @@ from libero.libero import benchmark
 from libero.libero.envs import OffScreenRenderEnv
 
 # VLA-0 paths
-VLA0_REPO = "/home/daiyuntao/vla0_repo"
+VLA0_REPO = "/home/daiyuntao/vla0"
 if VLA0_REPO not in sys.path:
     sys.path.insert(0, VLA0_REPO)
 ROBOVERSE_PATH = f"{VLA0_REPO}/libs/RoboVerse"
@@ -62,7 +62,7 @@ from experiments.robot.robot_utils import (
 # VLA-0 checkpoint
 VLA0_CHECKPOINT = os.environ.get(
     "VLA0_CHECKPOINT",
-    "/home/daiyuntao/jetson-containers/data/models/huggingface/models--ankgoyal--vla0-libero/snapshots/6c62a511ad56042b2b3ea0a90c4def33e1ea3b96/model_last.pth"
+    "/home/daiyuntao/vla0/runs/vla0/model_last.pth"
 )
 
 NUM_STEPS_WAIT = 10
@@ -147,11 +147,11 @@ class _CompatCfg:
             "state_key": "state",
         }
         class _IMAGE:
-            crop_img = 1.0
+            crop_img = 0.875  # match native eval / training config
             img_size = 224
             cam_list = ("3p1", "3p2")
             return_ee = False
-            return_ori_act = False
+            return_ori_act = True  # match img_libero_aug.yaml
             return_proprio = False
         self.IMAGE = _IMAGE()
 
@@ -160,7 +160,8 @@ class _CompatCfg:
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
     set_seed_everywhere(cfg.seed)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    gpu_id = int(os.environ.get("VLA0_GPU", "0"))
+    device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
 
     # Load model
     use_af = cfg.use_pipe
@@ -199,7 +200,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
     log_file.write(f"Task suite: {cfg.task_suite_name}\n")
 
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(min(1, num_tasks_in_suite))):  # single task for verification
+    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = get_libero_env(task, cfg.model_family, resolution=256)
