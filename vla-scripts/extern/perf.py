@@ -72,7 +72,7 @@ def verify_openvla() -> None:
     # )
 
     print("[*] Injecting ActionFlow Acceleration...")
-    # vla = enable_actionflow(vla, max_new_tokens=7)
+    vla = enable_actionflow(vla, max_new_tokens=7)
 
     prompt = get_openvla_prompt(INSTRUCTION)
 

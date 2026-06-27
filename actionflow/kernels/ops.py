@@ -3,6 +3,23 @@ import torch
 import torch.nn as nn
 import triton.language as tl
 
+# ---------------------------------------------------------------------------
+# CUDA-optimized kernels  (JIT-compiled lazily via load_inline).
+# fused_rope_write_kv_wrapper and shift_varlen_kv_cache_wrapper below hardcode
+# the CUDA path (Triton launch retained as comment for A/B comparison).
+# See README.md for benchmarks and methodology (pipelined vs synced timing).
+# ---------------------------------------------------------------------------
+try:
+    from .cuda_ops import (
+        cuda_rmsnorm_fwd,
+        cuda_fused_rope_write_kv,
+        cuda_fused_qwen_mrope_write_kv,
+        cuda_shift_varlen_kv_cache,
+    )
+    HAS_CUDA_OPS = True
+except Exception:
+    HAS_CUDA_OPS = False
+
 
 @triton.jit
 def rmsnorm_fwd_kernel(
@@ -277,38 +294,53 @@ def fused_rope_write_kv_wrapper(
     assert cos.is_contiguous() and sin.is_contiguous()
     assert cos.shape[1] == D
 
-    grid = (L_q, max(H_q, H_kv))
-
-    fused_rope_write_kv_kernel[grid](
-        Q_new_ptr=Q_new_in,
-        K_new_ptr=K_new_in,
-        V_new_ptr=V_new_in,
-        Q_out_ptr=q_varlen,
-        kv_ring_ptr=kv_ring_buffer,
-        cos_ptr=cos,
-        sin_ptr=sin,
-        total_L_q=L_q,
-        total_max_L=total_L_kv_buffer,
+    # ========================= KERNEL DISPATCH =========================
+    # Hardcoded to the CUDA kernel (README: ~84-88% DRAM peak vs Triton's
+    # 58-66%).  To benchmark the Triton baseline instead, comment out the
+    # cuda_* call below and uncomment the Triton launch.
+    cuda_fused_rope_write_kv(
+        Q_new=Q_new_in,
+        K_new=K_new_in,
+        V_new=V_new_in,
+        Q_out=q_varlen,
+        kv_ring=kv_ring_buffer,
+        cos=cos,
+        sin=sin,
         prefill_len=prefill_len,
-        D=D,
-        stride_ql=Q_new_in.stride(0),
-        stride_qh=Q_new_in.stride(1),
-        stride_kl=K_new_in.stride(0),
-        stride_kh=K_new_in.stride(1),
-        stride_vl=V_new_in.stride(0),
-        stride_vh=V_new_in.stride(1),
-        stride_qo_l=q_varlen.stride(0),
-        stride_qo_h=q_varlen.stride(1),
-        stride_ring_k_dim=kv_ring_buffer.stride(0),
-        stride_ring_seq=kv_ring_buffer.stride(1),
-        stride_ring_h=kv_ring_buffer.stride(2),
-        stride_cos_l=cos.stride(0),
-        stride_sin_l=sin.stride(0),
-        BLOCK_D=D,
-        D_half=D_half,
-        H_q=H_q,
-        H_kv=H_kv,
     )
+
+    # --- Triton baseline (original); uncomment to switch back ---
+    # grid = (L_q, max(H_q, H_kv))
+    # fused_rope_write_kv_kernel[grid](
+    #     Q_new_ptr=Q_new_in,
+    #     K_new_ptr=K_new_in,
+    #     V_new_ptr=V_new_in,
+    #     Q_out_ptr=q_varlen,
+    #     kv_ring_ptr=kv_ring_buffer,
+    #     cos_ptr=cos,
+    #     sin_ptr=sin,
+    #     total_L_q=L_q,
+    #     total_max_L=total_L_kv_buffer,
+    #     prefill_len=prefill_len,
+    #     D=D,
+    #     stride_ql=Q_new_in.stride(0),
+    #     stride_qh=Q_new_in.stride(1),
+    #     stride_kl=K_new_in.stride(0),
+    #     stride_kh=K_new_in.stride(1),
+    #     stride_vl=V_new_in.stride(0),
+    #     stride_vh=V_new_in.stride(1),
+    #     stride_qo_l=q_varlen.stride(0),
+    #     stride_qo_h=q_varlen.stride(1),
+    #     stride_ring_k_dim=kv_ring_buffer.stride(0),
+    #     stride_ring_seq=kv_ring_buffer.stride(1),
+    #     stride_ring_h=kv_ring_buffer.stride(2),
+    #     stride_cos_l=cos.stride(0),
+    #     stride_sin_l=sin.stride(0),
+    #     BLOCK_D=D,
+    #     D_half=D_half,
+    #     H_q=H_q,
+    #     H_kv=H_kv,
+    # )
 
 
 # ==============================================================================
@@ -628,19 +660,29 @@ def shift_varlen_kv_cache_wrapper(kv_cache: torch.Tensor, B_stages: int, prefill
 
     kv_cache = kv_cache.contiguous()
 
-    L_max = prefill_len + B_stages - 1
-    grid = (L_max, H_kv, K_V_dim)
-
-    strides = kv_cache.stride()
-    shift_varlen_kv_cache_kernel[grid](
-        KV_Cache_ptr=kv_cache,
-        stride_kv_k_dim=strides[0],
-        stride_kv_seq=strides[1],
-        stride_kv_head=strides[2],
-        H_kv=H_kv,
-        D=D,
-        PREFILL_LEN=prefill_len,
-        B_STAGES=B_stages,
-        BLOCK_D=D,
+    # ========================= KERNEL DISPATCH =========================
+    # Hardcoded to the CUDA kernel (README: B=7 ~88.8% peak; B>=16 ~88%
+    # physical vs Triton's 28-32%).  To benchmark the Triton baseline,
+    # comment out the cuda_* call and uncomment the Triton launch.
+    cuda_shift_varlen_kv_cache(
+        kv_cache=kv_cache,
+        B_stages=B_stages,
+        prefill_len=prefill_len,
     )
+
+    # --- Triton baseline (original); uncomment to switch back ---
+    # L_max = prefill_len + B_stages - 1
+    # grid = (L_max, H_kv, K_V_dim)
+    # strides = kv_cache.stride()
+    # shift_varlen_kv_cache_kernel[grid](
+    #     KV_Cache_ptr=kv_cache,
+    #     stride_kv_k_dim=strides[0],
+    #     stride_kv_seq=strides[1],
+    #     stride_kv_head=strides[2],
+    #     H_kv=H_kv,
+    #     D=D,
+    #     PREFILL_LEN=prefill_len,
+    #     B_STAGES=B_stages,
+    #     BLOCK_D=D,
+    # )
     return kv_cache
